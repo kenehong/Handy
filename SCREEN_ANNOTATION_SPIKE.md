@@ -44,8 +44,10 @@ While annotating:
   The source is the window under the pointer when annotation starts, even if a
   different application has keyboard focus. The original paste destination is
   unchanged.
-  Keep holding Left Alt+Space; Ctrl still starts the next point and does not
-  become Ctrl+wheel zoom in the source application.
+  Keep holding Left Alt+Space. After scrolling, wait for the view to update,
+  then **press and release Ctrl before drawing the next annotation**. This starts
+  the next numbered point and speech segment; Ctrl does not become Ctrl+wheel
+  zoom in the source application.
 - Previous ink stays with its original screen capture, not over the new
   content. The live surface intercepts drawing presses: they never click a
   source link, button, or selection. A point can span several
@@ -237,6 +239,9 @@ override before a normal application build.
 ## Prototype constraints
 
 - Windows only.
+- User trial (2026-10-29): the user confirmed scrolling worked, with a slight
+  delay before the view updated. This manual report does not establish automated
+  end-to-end verification or coverage of all input/application-host combinations.
 - One production startup attempt failed with WebView2 `0x80070057` before the
   main UI and shortcuts initialized. An instrumented restart succeeded without a
   product startup change. The failing API and cause remain unconfirmed; the
