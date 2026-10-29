@@ -17,6 +17,8 @@ mod overlay;
 mod paste_tx;
 pub mod portable;
 mod screen_annotation;
+#[cfg(all(target_os = "windows", feature = "annotation-scroll-check"))]
+pub use screen_annotation::scroll_check::run as run_annotation_scroll_check;
 mod secure_input;
 mod settings;
 mod shortcut;
@@ -252,7 +254,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             )
             .unwrap(),
         )
-        .tooltip(tray::tray_tooltip())
+        .tooltip(tray::tray_tooltip(app_handle))
         .icon_as_template(true);
 
     // Windows notification-area convention: left click opens the app, right click
@@ -730,6 +732,8 @@ pub fn run(cli_args: CliArgs) {
             commands::initialize_shortcuts,
             screen_annotation::complete_screen_annotation,
             screen_annotation::advance_screen_annotation,
+            screen_annotation::scroll_screen_annotation,
+            screen_annotation::freeze_screen_annotation,
             screen_annotation::get_screen_annotation_snapshot,
             screen_annotation::show_screen_annotation,
             screen_annotation::submit_screen_annotation,
@@ -942,7 +946,12 @@ pub fn run(cli_args: CliArgs) {
             // for portable mode (redirects WebView2 cache to portable Data dir)
             let mut win_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
-                    .title("Handy")
+                    .title(
+                        app.config()
+                            .product_name
+                            .as_deref()
+                            .expect("App product name must be configured"),
+                    )
                     .inner_size(680.0, 570.0)
                     .min_inner_size(680.0, 570.0)
                     .resizable(true)

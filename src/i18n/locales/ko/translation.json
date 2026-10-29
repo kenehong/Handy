@@ -653,7 +653,10 @@
     "clearInk": "선 지우기",
     "inkColor": "선 색상",
     "strokeWidth": "선 굵기",
-    "actionFailed": "주석을 업데이트하지 못했습니다."
+    "actionFailed": "주석을 업데이트하지 못했습니다.",
+    "scrollHint": "스크롤하면 원래 페이지가 이동합니다. 이전 주석은 해당 화면 캡처에 보존됩니다.",
+    "scrollFailed": "화면을 갱신하지 못했습니다. 주석은 보존되어 있습니다. 스크롤해서 다시 시도하세요.",
+    "screenNumber": "화면 {{number}}"
   },
   "common": {
     "loading": "로딩 중...",

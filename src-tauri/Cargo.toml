@@ -7,6 +7,14 @@ edition = "2021"
 license = "MIT"
 default-run = "handy"
 
+[features]
+annotation-scroll-check = ["tauri/unstable"]
+
+[[test]]
+name = "annotation_scroll"
+path = "tests/annotation_scroll.rs"
+required-features = ["annotation-scroll-check"]
+
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.
 
@@ -121,7 +129,10 @@ windows = { version = "0.61.3", features = [
   "Win32_System_Variant",
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
 ] }
 winreg = "0.55"
 

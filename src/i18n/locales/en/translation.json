@@ -656,7 +656,10 @@
     "clearInk": "Clear ink",
     "inkColor": "Ink color",
     "strokeWidth": "Stroke width",
-    "actionFailed": "Couldn't update the annotation."
+    "actionFailed": "Couldn't update the annotation.",
+    "scrollHint": "Scroll to move the original page. Previous annotations stay with their captured screen.",
+    "scrollFailed": "Couldn't refresh the page. Your annotations are preserved. Scroll to retry.",
+    "screenNumber": "Screen {{number}}"
   },
   "common": {
     "loading": "Loading...",

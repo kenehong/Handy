@@ -1,5 +1,7 @@
 {
+  "productName": "Handy Preview",
   "bundle": {
+    "icon": ["icons/preview.ico", "icons/preview.png"],
     "resources": {
       "resources": "resources",
       "transcribe-libs": "."

@@ -189,29 +189,52 @@ fn windows_taskbar_theme() -> Option<AppTheme> {
 /// blocked (macOS Secure Input); recording/transcribing states keep their
 /// normal icons so in-flight activity stays recognizable.
 pub fn get_icon_path(theme: AppTheme, state: TrayIconState, warning: bool) -> &'static str {
-    if warning && state == TrayIconState::Idle {
-        return match theme {
+    let path = if warning && state == TrayIconState::Idle {
+        match theme {
             AppTheme::Dark => "resources/tray_idle_warning.png",
             AppTheme::Light => "resources/tray_idle_warning_dark.png",
             // Linux never sets the warning flag (Secure Input is macOS-only),
             // but fall back to the normal icon just in case.
             AppTheme::Colored => "resources/handy.png",
-        };
+        }
+    } else {
+        match (theme, state) {
+            // Dark theme uses light icons
+            (AppTheme::Dark, TrayIconState::Idle) => "resources/tray_idle.png",
+            (AppTheme::Dark, TrayIconState::Recording) => "resources/tray_recording.png",
+            (AppTheme::Dark, TrayIconState::Transcribing) => "resources/tray_transcribing.png",
+            // Light theme uses dark icons
+            (AppTheme::Light, TrayIconState::Idle) => "resources/tray_idle_dark.png",
+            (AppTheme::Light, TrayIconState::Recording) => "resources/tray_recording_dark.png",
+            (AppTheme::Light, TrayIconState::Transcribing) => {
+                "resources/tray_transcribing_dark.png"
+            }
+            // Colored theme uses pink icons (for Linux)
+            (AppTheme::Colored, TrayIconState::Idle) => "resources/handy.png",
+            (AppTheme::Colored, TrayIconState::Recording) => "resources/recording.png",
+            (AppTheme::Colored, TrayIconState::Transcribing) => "resources/transcribing.png",
+        }
+    };
+    #[cfg(target_os = "windows")]
+    {
+        match path {
+            "resources/tray_idle.png" => "resources/preview/tray_idle.png",
+            "resources/tray_idle_dark.png" => "resources/preview/tray_idle_dark.png",
+            "resources/tray_recording.png" => "resources/preview/tray_recording.png",
+            "resources/tray_recording_dark.png" => "resources/preview/tray_recording_dark.png",
+            "resources/tray_transcribing.png" => "resources/preview/tray_transcribing.png",
+            "resources/tray_transcribing_dark.png" => {
+                "resources/preview/tray_transcribing_dark.png"
+            }
+            "resources/tray_idle_warning.png" => "resources/preview/tray_idle_warning.png",
+            "resources/tray_idle_warning_dark.png" => {
+                "resources/preview/tray_idle_warning_dark.png"
+            }
+            _ => path,
+        }
     }
-    match (theme, state) {
-        // Dark theme uses light icons
-        (AppTheme::Dark, TrayIconState::Idle) => "resources/tray_idle.png",
-        (AppTheme::Dark, TrayIconState::Recording) => "resources/tray_recording.png",
-        (AppTheme::Dark, TrayIconState::Transcribing) => "resources/tray_transcribing.png",
-        // Light theme uses dark icons
-        (AppTheme::Light, TrayIconState::Idle) => "resources/tray_idle_dark.png",
-        (AppTheme::Light, TrayIconState::Recording) => "resources/tray_recording_dark.png",
-        (AppTheme::Light, TrayIconState::Transcribing) => "resources/tray_transcribing_dark.png",
-        // Colored theme uses pink icons (for Linux)
-        (AppTheme::Colored, TrayIconState::Idle) => "resources/handy.png",
-        (AppTheme::Colored, TrayIconState::Recording) => "resources/recording.png",
-        (AppTheme::Colored, TrayIconState::Transcribing) => "resources/transcribing.png",
-    }
+    #[cfg(not(target_os = "windows"))]
+    path
 }
 
 /// Sets the recording state shown by the tray (icon + Cancel/model menu).
@@ -439,15 +462,20 @@ fn load_tray_icon(resolved_icon_path: tauri::Result<PathBuf>) -> tauri::Result<I
     Image::from_path(&resolved_icon_path).map(Image::to_owned)
 }
 
-pub fn tray_tooltip() -> String {
-    version_label()
+pub fn tray_tooltip(app: &AppHandle) -> String {
+    version_label(
+        app.config()
+            .product_name
+            .as_deref()
+            .expect("App product name must be configured"),
+    )
 }
 
-fn version_label() -> String {
+fn version_label(product_name: &str) -> String {
     if cfg!(debug_assertions) {
-        format!("Handy v{} (Dev)", env!("CARGO_PKG_VERSION"))
+        format!("{product_name} v{} (Dev)", env!("CARGO_PKG_VERSION"))
     } else {
-        format!("Handy v{}", env!("CARGO_PKG_VERSION"))
+        format!("{product_name} v{}", env!("CARGO_PKG_VERSION"))
     }
 }
 
@@ -486,7 +514,7 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
     let (settings_accelerator, quit_accelerator) = (Some("Ctrl+,"), Some("Ctrl+Q"));
 
     // Create common menu items
-    let version_label = version_label();
+    let version_label = tray_tooltip(app);
     let version_i = MenuItem::with_id(app, "version", &version_label, false, None::<&str>)?;
     let settings_i = MenuItem::with_id(
         app,
@@ -670,6 +698,56 @@ pub fn copy_last_transcript(app: &AppHandle) {
 mod tests {
     use super::{last_transcript_text, load_tray_icon, MenuInputs, TrayDesired, TrayIconState};
     use crate::managers::history::HistoryEntry;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn preview_badge_remains_on_every_windows_tray_state_and_theme() {
+        use super::{get_icon_path, AppTheme};
+        for theme in [AppTheme::Dark, AppTheme::Light] {
+            let mut images = Vec::new();
+            for state in [
+                TrayIconState::Idle,
+                TrayIconState::Recording,
+                TrayIconState::Transcribing,
+            ] {
+                for warning in [false, true] {
+                    let path = get_icon_path(theme.clone(), state, warning);
+                    assert!(path.starts_with("resources/preview/"));
+                    let icon = load_tray_icon(Ok(
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
+                    ))
+                    .expect("preview tray resource");
+                    assert_eq!((icon.width(), icon.height()), (64, 64));
+                    let offset = (16 * 64 + 5) * 4;
+                    assert_eq!(&icon.rgba()[offset..offset + 4], &[32, 72, 200, 255]);
+                    assert_eq!(icon.rgba()[3], 0);
+                    if !warning {
+                        images.push(icon.rgba().to_vec());
+                    }
+                }
+            }
+            assert_ne!(images[0], images[1]);
+            assert_ne!(images[1], images[2]);
+            assert_ne!(images[0], images[2]);
+        }
+    }
+
+    #[test]
+    fn preview_display_name_keeps_the_existing_application_identity() {
+        let windows: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
+        let base: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(windows["productName"], "Handy Preview");
+        assert_eq!(base["identifier"], "com.pais.handy");
+        assert!(windows.get("identifier").is_none());
+        assert!(super::version_label("Handy Preview").starts_with("Handy Preview v"));
+        for path in windows["bundle"]["icon"].as_array().unwrap() {
+            assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(path.as_str().unwrap())
+                .is_file());
+        }
+    }
 
     fn build_entry(transcription: &str, post_processed: Option<&str>) -> HistoryEntry {
         HistoryEntry {

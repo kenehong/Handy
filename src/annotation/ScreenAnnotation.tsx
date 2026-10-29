@@ -1,18 +1,10 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { ArrowRight, Check, Trash2 } from "lucide-react";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { events } from "@/bindings";
-import type { StreamTextEvent } from "@/bindings";
-
-interface ScreenAnnotationSnapshot {
-  session_id: number;
-  path: string;
-  width: number;
-  height: number;
-  point_count: number;
-}
+import type { ScreenAnnotationSnapshot, StreamTextEvent } from "@/bindings";
 
 interface Point {
   x: number;
@@ -22,6 +14,28 @@ interface Point {
 interface AnnotationPoint {
   number: number;
   position?: Point;
+}
+
+interface CapturedPage {
+  canvas: HTMLCanvasElement;
+  points: AnnotationPoint[];
+  scale: number;
+}
+
+interface PageScroll {
+  x: number;
+  y: number;
+  deltaX: number;
+  deltaY: number;
+}
+
+interface BrowseInput {
+  session_id: number;
+  kind: "down" | "move" | "up" | "wheel";
+  x: number;
+  y: number;
+  delta_x: number;
+  delta_y: number;
 }
 
 function markerPosition(
@@ -42,6 +56,62 @@ function markerPosition(
   };
 }
 
+function preservePage(
+  canvas: HTMLCanvasElement,
+  points: AnnotationPoint[],
+): CapturedPage {
+  const copy = document.createElement("canvas");
+  copy.width = canvas.width;
+  copy.height = canvas.height;
+  const context = copy.getContext("2d");
+  if (!context) throw new Error("Cannot preserve the annotated screen");
+  context.drawImage(canvas, 0, 0);
+  return {
+    canvas: copy,
+    points: [...points],
+    scale: canvas.width / canvas.getBoundingClientRect().width,
+  };
+}
+
+function renderPage(page: CapturedPage, heading?: string): string {
+  const { canvas, points, scale } = page;
+  const header = heading ? Math.ceil(40 * scale) : 0;
+  const output = document.createElement("canvas");
+  output.width = canvas.width;
+  output.height = canvas.height + header;
+  const context = output.getContext("2d");
+  if (!context) throw new Error("Cannot render the numbered screenshot");
+  if (heading) {
+    context.fillStyle = "#111";
+    context.fillRect(0, 0, output.width, header);
+    context.fillStyle = "#fff";
+    context.font = `${16 * scale}px sans-serif`;
+    context.textBaseline = "middle";
+    context.fillText(heading, 18 * scale, header / 2);
+  }
+  context.translate(0, header);
+  context.drawImage(canvas, 0, 0);
+  for (const point of points) {
+    const position = markerPosition(point, canvas.width, canvas.height, scale);
+    context.beginPath();
+    context.arc(position.x, position.y, 14 * scale, 0, Math.PI * 2);
+    context.fillStyle = "#111";
+    context.fill();
+    context.lineWidth = 2 * scale;
+    context.strokeStyle = "#fff";
+    context.stroke();
+    context.font = `bold ${14 * scale}px sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillStyle = "#fff";
+    context.fillText(String(point.number), position.x, position.y);
+  }
+  const png = output.toDataURL("image/png");
+  if (!png.startsWith("data:image/png;base64,"))
+    throw new Error("The annotated screen is too large to export");
+  return png;
+}
+
 const ScreenAnnotation: React.FC = () => {
   const { t } = useTranslation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -50,14 +120,34 @@ const ScreenAnnotation: React.FC = () => {
   const drawingRef = useRef(false);
   const lastPointRef = useRef<Point>();
   const sessionIdRef = useRef<number>();
+  const captureIdRef = useRef(0);
+  const displayedCaptureIdRef = useRef(0);
+  const pointCountRef = useRef(1);
   const pointsRef = useRef<AnnotationPoint[]>([{ number: 1 }]);
   const pointChangeRef = useRef<Promise<void>>();
+  const scrollRef = useRef<Promise<void>>();
+  const pendingScrollRef = useRef<PageScroll>();
+  const pagesRef = useRef<CapturedPage[]>([]);
+  const browsePageRef = useRef<CapturedPage>();
+  const browsingRef = useRef(false);
+  const freezeRef = useRef<Promise<void>>();
+  const pendingStrokeRef = useRef<{
+    points: Point[];
+    ended: boolean;
+    number: number;
+  }>();
+  const strokeReadyRef = useRef<Promise<void>>();
+  const nativeInputRef = useRef<(input: BrowseInput) => void>();
   const finalizingRef = useRef(false);
   const [points, setPoints] = useState(pointsRef.current);
   const [imageSize, setImageSize] = useState({ width: 1, height: 1 });
   const [busy, setBusy] = useState(false);
   const [finishing, setFinishing] = useState(false);
   const [actionFailed, setActionFailed] = useState(false);
+  const [scrolling, setScrolling] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+  const [freezing, setFreezing] = useState(false);
+  const [scrollFailed, setScrollFailed] = useState(false);
   const [color, setColor] = useState("#ff2d55");
   const [brushSize, setBrushSize] = useState(7);
   const [streamText, setStreamText] = useState<StreamTextEvent>({
@@ -72,14 +162,16 @@ const ScreenAnnotation: React.FC = () => {
 
   const syncPointCount = useCallback(
     (count: number) => {
-      const current = pointsRef.current;
-      if (count <= current.length) return;
+      const currentCount = pointCountRef.current;
+      if (count <= currentCount) return;
+      pointCountRef.current = count;
       drawingRef.current = false;
       lastPointRef.current = undefined;
+      if (pendingStrokeRef.current) pendingStrokeRef.current.ended = true;
       updatePoints([
-        ...current,
-        ...Array.from({ length: count - current.length }, (_, index) => ({
-          number: current.length + index + 1,
+        ...pointsRef.current,
+        ...Array.from({ length: count - currentCount }, (_, index) => ({
+          number: currentCount + index + 1,
         })),
       ]);
     },
@@ -96,55 +188,253 @@ const ScreenAnnotation: React.FC = () => {
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
   }, []);
 
+  const restoreBrowsePage = useCallback(() => {
+    const canvas = canvasRef.current;
+    const previous = browsePageRef.current;
+    if (previous) {
+      const context = canvas?.getContext("2d");
+      if (!context) throw new Error("Cannot restore the annotated screen");
+      context.drawImage(previous.canvas, 0, 0);
+      const last = previous.points[previous.points.length - 1]?.number ?? 0;
+      updatePoints([
+        ...previous.points,
+        ...pointsRef.current.filter((point) => point.number > last),
+      ]);
+    }
+    browsePageRef.current = undefined;
+    browsingRef.current = false;
+    pendingStrokeRef.current = undefined;
+    setBrowsing(false);
+  }, [updatePoints]);
+
+  const freezePage = useCallback((): Promise<void> => {
+    if (freezeRef.current) return freezeRef.current;
+    if (!browsingRef.current) return Promise.resolve();
+    const sessionId = sessionIdRef.current;
+    pendingScrollRef.current = undefined;
+    setFreezing(true);
+    setScrollFailed(false);
+    const operation = (async () => {
+      try {
+        await scrollRef.current;
+        if (sessionIdRef.current !== sessionId || !browsingRef.current) return;
+        const latest = await invoke<ScreenAnnotationSnapshot>(
+          "freeze_screen_annotation",
+          { sessionId, captureId: captureIdRef.current },
+        );
+        if (sessionIdRef.current !== sessionId) return;
+        captureIdRef.current = latest.capture_id;
+        syncPointCount(latest.point_count);
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.src = convertFileSrc(latest.path);
+        await image.decode();
+        if (sessionIdRef.current !== sessionId) return;
+        const canvas = canvasRef.current;
+        const previous = browsePageRef.current;
+        const context = canvas?.getContext("2d");
+        if (!canvas || !context || !previous)
+          throw new Error("Cannot restore the browsed annotation");
+        if (latest.capture_id !== displayedCaptureIdRef.current) {
+          pagesRef.current.push(previous);
+          context.drawImage(image, 0, 0);
+          const newPoints = pointsRef.current.filter(
+            (point) =>
+              !previous.points.some((old) => old.number === point.number),
+          );
+          updatePoints(
+            newPoints.length ? newPoints : [{ number: pointCountRef.current }],
+          );
+        } else {
+          context.drawImage(previous.canvas, 0, 0);
+        }
+        snapshotImageRef.current = image;
+        displayedCaptureIdRef.current = latest.capture_id;
+        browsePageRef.current = undefined;
+        browsingRef.current = false;
+        setBrowsing(false);
+        if (!finalizingRef.current) {
+          await invoke("show_screen_annotation", {
+            sessionId,
+            captureId: latest.capture_id,
+          });
+        }
+        void emit("screen-annotation-preview-drawn", {
+          session_id: sessionId,
+          capture_id: latest.capture_id,
+        }).catch(console.error);
+      } catch (error) {
+        if (sessionIdRef.current === sessionId) {
+          restoreBrowsePage();
+          setScrollFailed(true);
+          if (!finalizingRef.current)
+            await invoke("show_screen_annotation", {
+              sessionId,
+              captureId: captureIdRef.current,
+            });
+        }
+        throw error;
+      } finally {
+        if (sessionIdRef.current === sessionId) {
+          freezeRef.current = undefined;
+          setFreezing(false);
+        }
+      }
+    })();
+    freezeRef.current = operation;
+    return operation;
+  }, [restoreBrowsePage, syncPointCount, updatePoints]);
+
   const finalize = useCallback(async () => {
     const sessionId = sessionIdRef.current;
     if (sessionId === undefined) return;
     finalizingRef.current = true;
+    if (pendingStrokeRef.current) pendingStrokeRef.current.ended = true;
+    pendingScrollRef.current = undefined;
     setFinishing(true);
     await snapshotReadyRef.current;
     await pointChangeRef.current;
+    await scrollRef.current;
+    await freezePage();
+    await strokeReadyRef.current;
     if (sessionIdRef.current !== sessionId) return;
     const canvas = canvasRef.current;
     if (!canvas) throw new Error("The annotation canvas is unavailable");
-    const output = document.createElement("canvas");
-    output.width = canvas.width;
-    output.height = canvas.height;
-    const context = output.getContext("2d");
-    if (!context) throw new Error("Cannot render the numbered screenshot");
-    context.drawImage(canvas, 0, 0);
-    const scale = canvas.width / canvas.getBoundingClientRect().width;
-    for (const point of pointsRef.current) {
-      const position = markerPosition(
-        point,
-        output.width,
-        output.height,
-        scale,
-      );
-      context.beginPath();
-      context.arc(position.x, position.y, 14 * scale, 0, Math.PI * 2);
-      context.fillStyle = "#111";
-      context.fill();
-      context.lineWidth = 2 * scale;
-      context.strokeStyle = "#fff";
-      context.stroke();
-      context.font = `bold ${14 * scale}px sans-serif`;
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillStyle = "#fff";
-      context.fillText(String(point.number), position.x, position.y);
-    }
+    const pages = [
+      ...pagesRef.current,
+      preservePage(canvas, pointsRef.current),
+    ];
+    const pngs = pages.map((page, index) =>
+      renderPage(
+        page,
+        pages.length > 1
+          ? t("screenAnnotation.screenNumber", { number: index + 1 })
+          : undefined,
+      ),
+    );
     await invoke("submit_screen_annotation", {
       sessionId,
-      pngDataUrl: output.toDataURL("image/png"),
-      pointCount: pointsRef.current.length,
+      pngDataUrl: pngs[0],
+      additionalPngDataUrls: pngs.slice(1),
+      pointCount: pointCountRef.current,
     });
-  }, []);
+  }, [t, freezePage]);
+
+  const scrollPage = useCallback(
+    (input: PageScroll) => {
+      const sessionId = sessionIdRef.current;
+      const canvas = canvasRef.current;
+      if (
+        sessionId === undefined ||
+        !canvas ||
+        !snapshotImageRef.current ||
+        finalizingRef.current ||
+        freezeRef.current ||
+        pointChangeRef.current
+      )
+        return;
+      const pending = pendingScrollRef.current;
+      pendingScrollRef.current = {
+        ...input,
+        deltaX: (pending?.deltaX ?? 0) + input.deltaX,
+        deltaY: (pending?.deltaY ?? 0) + input.deltaY,
+      };
+      if (scrollRef.current) return;
+      drawingRef.current = false;
+      lastPointRef.current = undefined;
+      setScrolling(true);
+      setScrollFailed(false);
+      const operation = (async () => {
+        try {
+          await snapshotReadyRef.current;
+          if (sessionIdRef.current !== sessionId) return;
+          if (!browsingRef.current) {
+            const context = canvas.getContext("2d");
+            if (!context) throw new Error("Cannot release the frozen screen");
+            browsePageRef.current = preservePage(canvas, pointsRef.current);
+            browsingRef.current = true;
+            setBrowsing(true);
+            context.clearRect(0, 0, canvas.width, canvas.height);
+          }
+          while (pendingScrollRef.current) {
+            const queued = pendingScrollRef.current;
+            const dx = Math.max(-32767, Math.min(32767, queued.deltaX));
+            const dy = Math.max(-32767, Math.min(32767, queued.deltaY));
+            pendingScrollRef.current =
+              queued.deltaX !== dx || queued.deltaY !== dy
+                ? {
+                    ...queued,
+                    deltaX: queued.deltaX - dx,
+                    deltaY: queued.deltaY - dy,
+                  }
+                : undefined;
+            const latest = await invoke<ScreenAnnotationSnapshot>(
+              "scroll_screen_annotation",
+              {
+                sessionId,
+                captureId: captureIdRef.current,
+                deltaX: dx,
+                deltaY: dy,
+                x: queued.x,
+                y: queued.y,
+              },
+            );
+            if (sessionIdRef.current !== sessionId) return;
+            captureIdRef.current = latest.capture_id;
+            syncPointCount(latest.point_count);
+          }
+        } catch (error) {
+          console.error("Failed to refresh the annotated page:", error);
+          if (sessionIdRef.current === sessionId) {
+            pendingScrollRef.current = undefined;
+            restoreBrowsePage();
+            setScrollFailed(true);
+            if (!finalizingRef.current)
+              await invoke("show_screen_annotation", {
+                sessionId,
+                captureId: captureIdRef.current,
+              });
+          }
+        } finally {
+          if (sessionIdRef.current === sessionId) {
+            scrollRef.current = undefined;
+            setScrolling(false);
+          }
+        }
+      })();
+      scrollRef.current = operation;
+    },
+    [syncPointCount, restoreBrowsePage],
+  );
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const unit =
+        event.deltaMode === 1 ? 40 : event.deltaMode === 2 ? rect.height : 1;
+      const deltaX = Math.round(event.deltaX * unit);
+      const deltaY = -Math.round(event.deltaY * unit);
+      if (deltaX === 0 && deltaY === 0) return;
+      scrollPage({
+        x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+        y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+        deltaX,
+        deltaY,
+      });
+    };
+    canvas.addEventListener("wheel", wheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", wheel);
+  }, [scrollPage]);
 
   const advancePoint = useCallback(() => {
     const sessionId = sessionIdRef.current;
     if (
       sessionId === undefined ||
       pointChangeRef.current ||
+      scrollRef.current ||
       finalizingRef.current
     )
       return;
@@ -156,7 +446,7 @@ const ScreenAnnotation: React.FC = () => {
       try {
         const number = await invoke<number>("advance_screen_annotation", {
           sessionId,
-          pointNumber: pointsRef.current.length,
+          pointNumber: pointCountRef.current,
         });
         if (sessionIdRef.current === sessionId) {
           syncPointCount(number);
@@ -191,12 +481,25 @@ const ScreenAnnotation: React.FC = () => {
     let unlistenReset: (() => void) | undefined;
     let unlistenStream: (() => void) | undefined;
     let unlistenNext: (() => void) | undefined;
+    let unlistenBrowse: (() => void) | undefined;
 
     const loadSnapshot = (snapshot: ScreenAnnotationSnapshot) => {
       if (disposed) return;
       sessionIdRef.current = snapshot.session_id;
+      captureIdRef.current = snapshot.capture_id;
+      displayedCaptureIdRef.current = snapshot.capture_id;
+      pointCountRef.current = snapshot.point_count;
       finalizingRef.current = false;
       pointChangeRef.current = undefined;
+      scrollRef.current = undefined;
+      pendingScrollRef.current = undefined;
+      browsePageRef.current = undefined;
+      browsingRef.current = false;
+      freezeRef.current = undefined;
+      pendingStrokeRef.current = undefined;
+      strokeReadyRef.current = undefined;
+      pagesRef.current = [];
+      snapshotImageRef.current = undefined;
       drawingRef.current = false;
       lastPointRef.current = undefined;
       updatePoints(
@@ -207,6 +510,10 @@ const ScreenAnnotation: React.FC = () => {
       setFinishing(false);
       setBusy(false);
       setActionFailed(false);
+      setScrolling(false);
+      setBrowsing(false);
+      setFreezing(false);
+      setScrollFailed(false);
 
       const image = new Image();
       image.crossOrigin = "anonymous";
@@ -240,6 +547,7 @@ const ScreenAnnotation: React.FC = () => {
             return;
           await invoke("show_screen_annotation", {
             sessionId: snapshot.session_id,
+            captureId: snapshot.capture_id,
           });
         })
         .catch((error) => {
@@ -252,39 +560,43 @@ const ScreenAnnotation: React.FC = () => {
     };
 
     const initialize = async () => {
-      [unlistenFinish, unlistenReset, unlistenStream, unlistenNext] =
-        await Promise.all([
-          listen("finish-screen-annotation", () => {
-            const sessionId = sessionIdRef.current;
-            void finalize().catch((error) => {
-              console.error("Failed to submit the numbered screenshot:", error);
-              if (sessionIdRef.current === sessionId) setActionFailed(true);
-            });
-          }),
-          listen<ScreenAnnotationSnapshot>(
-            "reset-screen-annotation",
-            (event) => {
-              setStreamText({ committed: "", tentative: "" });
-              loadSnapshot(event.payload);
-            },
-          ),
-          events.streamTextEvent.listen((event) =>
-            setStreamText(event.payload),
-          ),
-          listen<ScreenAnnotationSnapshot>(
-            "annotation-point-changed",
-            (event) => {
-              if (sessionIdRef.current === event.payload.session_id) {
-                syncPointCount(event.payload.point_count);
-              }
-            },
-          ),
-        ]);
+      [
+        unlistenFinish,
+        unlistenReset,
+        unlistenStream,
+        unlistenNext,
+        unlistenBrowse,
+      ] = await Promise.all([
+        listen("finish-screen-annotation", () => {
+          const sessionId = sessionIdRef.current;
+          void finalize().catch((error) => {
+            console.error("Failed to submit the numbered screenshot:", error);
+            if (sessionIdRef.current === sessionId) setActionFailed(true);
+          });
+        }),
+        listen<ScreenAnnotationSnapshot>("reset-screen-annotation", (event) => {
+          setStreamText({ committed: "", tentative: "" });
+          loadSnapshot(event.payload);
+        }),
+        events.streamTextEvent.listen((event) => setStreamText(event.payload)),
+        listen<ScreenAnnotationSnapshot>(
+          "annotation-point-changed",
+          (event) => {
+            if (sessionIdRef.current === event.payload.session_id) {
+              syncPointCount(event.payload.point_count);
+            }
+          },
+        ),
+        listen<BrowseInput>("annotation-browse-input", (event) => {
+          nativeInputRef.current?.(event.payload);
+        }),
+      ]);
       if (disposed) {
         unlistenFinish();
         unlistenReset();
         unlistenStream();
         unlistenNext();
+        unlistenBrowse();
         return;
       }
       const snapshot = await invoke<ScreenAnnotationSnapshot>(
@@ -300,6 +612,7 @@ const ScreenAnnotation: React.FC = () => {
       unlistenReset?.();
       unlistenStream?.();
       unlistenNext?.();
+      unlistenBrowse?.();
     };
   }, [drawSnapshot, finalize, updatePoints, syncPointCount]);
 
@@ -314,25 +627,77 @@ const ScreenAnnotation: React.FC = () => {
   };
 
   const beginStroke = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (pointChangeRef.current || finalizingRef.current) return;
+    event.preventDefault();
+    if (pointChangeRef.current || freezeRef.current || finalizingRef.current)
+      return;
     const point = pointFromEvent(event);
     if (!point) return;
     event.currentTarget.setPointerCapture(event.pointerId);
+    if (browsingRef.current) {
+      beginBufferedStroke(point);
+      return;
+    }
+    startStroke(point);
+  };
+
+  const beginBufferedStroke = (point: Point) => {
+    const sessionId = sessionIdRef.current;
+    const gesture = {
+      points: [point],
+      ended: false,
+      number: pointCountRef.current,
+    };
+    pendingStrokeRef.current = gesture;
+    const operation = freezePage()
+      .then(() => {
+        if (
+          pendingStrokeRef.current !== gesture ||
+          sessionIdRef.current !== sessionId
+        )
+          return;
+        pendingStrokeRef.current = undefined;
+        startStroke(gesture.points[0], gesture.number);
+        for (const next of gesture.points.slice(1)) paintStroke(next);
+        if (gesture.ended) {
+          drawingRef.current = false;
+          lastPointRef.current = undefined;
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to freeze the page for drawing:", error);
+      });
+    strokeReadyRef.current = operation;
+  };
+
+  const startStroke = (point: Point, number = pointCountRef.current) => {
     drawingRef.current = true;
     lastPointRef.current = point;
-    const current = pointsRef.current[pointsRef.current.length - 1];
-    if (current && !current.position) {
-      updatePoints([
-        ...pointsRef.current.slice(0, -1),
-        { ...current, position: point },
-      ]);
+    const current = pointsRef.current.find((entry) => entry.number === number);
+    if (!current?.position) {
+      updatePoints(
+        [
+          ...pointsRef.current.filter((entry) => entry.number !== number),
+          { number, position: point },
+        ].sort((a, b) => a.number - b.number),
+      );
     }
   };
 
   const continueStroke = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!drawingRef.current || finalizingRef.current) return;
-    const canvas = canvasRef.current;
+    if (finalizingRef.current) return;
     const point = pointFromEvent(event);
+    if (!point) return;
+    if (pendingStrokeRef.current) {
+      if (!pendingStrokeRef.current.ended)
+        pendingStrokeRef.current.points.push(point);
+      return;
+    }
+    paintStroke(point);
+  };
+
+  const paintStroke = (point: Point) => {
+    if (!drawingRef.current) return;
+    const canvas = canvasRef.current;
     const previous = lastPointRef.current;
     if (!canvas || !point || !previous) return;
 
@@ -351,15 +716,49 @@ const ScreenAnnotation: React.FC = () => {
   };
 
   const endStroke = () => {
+    if (pendingStrokeRef.current) pendingStrokeRef.current.ended = true;
     drawingRef.current = false;
     lastPointRef.current = undefined;
   };
 
+  nativeInputRef.current = (input) => {
+    if (input.session_id !== sessionIdRef.current || finalizingRef.current)
+      return;
+    if (input.kind === "wheel") {
+      scrollPage({
+        x: input.x,
+        y: input.y,
+        deltaX: input.delta_x,
+        deltaY: input.delta_y,
+      });
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const point = { x: input.x * canvas.width, y: input.y * canvas.height };
+    if (input.kind === "down") {
+      if (browsingRef.current && !freezeRef.current) beginBufferedStroke(point);
+    } else if (input.kind === "move") {
+      if (pendingStrokeRef.current) {
+        if (!pendingStrokeRef.current.ended)
+          pendingStrokeRef.current.points.push(point);
+      } else {
+        paintStroke(point);
+      }
+    } else {
+      endStroke();
+    }
+  };
+
   return (
-    <main className="annotation-stage">
+    <main
+      className={`annotation-stage${browsing ? " annotation-browsing" : ""}`}
+      aria-busy={scrolling || freezing}
+    >
       <canvas
         ref={canvasRef}
-        className="annotation-canvas"
+        className={`annotation-canvas${scrolling ? " annotation-scrolling" : ""}`}
+        aria-label={t("screenAnnotation.scrollHint")}
         onPointerDown={beginStroke}
         onPointerMove={continueStroke}
         onPointerUp={endStroke}
@@ -416,7 +815,7 @@ const ScreenAnnotation: React.FC = () => {
             title={t("screenAnnotation.clearInk")}
             aria-label={t("screenAnnotation.clearInk")}
             onClick={drawSnapshot}
-            disabled={busy || finishing}
+            disabled={busy || scrolling || finishing}
           >
             <Trash2 aria-hidden="true" />
           </button>
@@ -424,7 +823,12 @@ const ScreenAnnotation: React.FC = () => {
             className="annotation-button annotation-next"
             title={t("screenAnnotation.nextPointShortcut")}
             onClick={advancePoint}
-            disabled={busy || finishing || !points[points.length - 1]?.position}
+            disabled={
+              busy ||
+              scrolling ||
+              finishing ||
+              !points[points.length - 1]?.position
+            }
           >
             {t("screenAnnotation.nextPoint")}
             <ArrowRight aria-hidden="true" />
@@ -434,7 +838,7 @@ const ScreenAnnotation: React.FC = () => {
             title={t("settings.history.save")}
             aria-label={t("settings.history.save")}
             onClick={() => void complete()}
-            disabled={busy || finishing}
+            disabled={busy || scrolling || finishing}
           >
             <Check aria-hidden="true" />
           </button>
@@ -442,6 +846,11 @@ const ScreenAnnotation: React.FC = () => {
         {actionFailed && (
           <div className="annotation-transcript" role="alert">
             {t("screenAnnotation.actionFailed")}
+          </div>
+        )}
+        {scrollFailed && (
+          <div className="annotation-transcript" role="alert">
+            {t("screenAnnotation.scrollFailed")}
           </div>
         )}
         {(streamText.committed || streamText.tentative) && (

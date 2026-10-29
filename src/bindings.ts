@@ -640,6 +640,22 @@ async completeScreenAnnotation() : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async advanceScreenAnnotation(sessionId: number, pointNumber: number) : Promise<Result<number, string>> {
+   try {
+   return { status: "ok", data: await TAURI_INVOKE("advance_screen_annotation", { sessionId, pointNumber }) };
+} catch (e) {
+   if(e instanceof Error) throw e;
+   else return { status: "error", error: String(e) };
+}
+},
+async scrollScreenAnnotation(sessionId: number, captureId: number, deltaX: number, deltaY: number, x: number, y: number) : Promise<Result<ScreenAnnotationSnapshot, string>> {
+   try {
+   return { status: "ok", data: await TAURI_INVOKE("scroll_screen_annotation", { sessionId, captureId, deltaX, deltaY, x, y }) };
+} catch (e) {
+   if(e instanceof Error) throw e;
+   else return { status: "error", error: String(e) };
+}
+},
 async getScreenAnnotationSnapshot() : Promise<Result<ScreenAnnotationSnapshot, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_screen_annotation_snapshot") };
@@ -648,17 +664,17 @@ async getScreenAnnotationSnapshot() : Promise<Result<ScreenAnnotationSnapshot, s
     else return { status: "error", error: e  as any };
 }
 },
-async showScreenAnnotation(sessionId: number) : Promise<Result<null, string>> {
+async showScreenAnnotation(sessionId: number, captureId: number | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("show_screen_annotation", { sessionId }) };
+    return { status: "ok", data: await TAURI_INVOKE("show_screen_annotation", { sessionId, captureId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
-async submitScreenAnnotation(sessionId: number, pngDataUrl: string) : Promise<Result<null, string>> {
+async submitScreenAnnotation(sessionId: number, pngDataUrl: string, pointCount: number, additionalPngDataUrls: string[] | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("submit_screen_annotation", { sessionId, pngDataUrl }) };
+    return { status: "ok", data: await TAURI_INVOKE("submit_screen_annotation", { sessionId, pngDataUrl, pointCount, additionalPngDataUrls }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1110,7 +1126,7 @@ export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
-export type ScreenAnnotationSnapshot = { session_id: number; path: string; width: number; height: number }
+export type ScreenAnnotationSnapshot = { session_id: number; capture_id: number; path: string; width: number; height: number; point_count: number }
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 
 /**

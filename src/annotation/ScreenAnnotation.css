@@ -25,6 +25,19 @@ body,
   touch-action: none;
 }
 
+.annotation-scrolling {
+  cursor: progress;
+}
+
+.annotation-browsing {
+  background: transparent;
+}
+
+.annotation-browsing .annotation-markers,
+.annotation-browsing .annotation-hud {
+  visibility: hidden;
+}
+
 .annotation-hud {
   position: absolute;
   top: 18px;

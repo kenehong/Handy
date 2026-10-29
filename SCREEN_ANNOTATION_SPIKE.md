@@ -4,6 +4,12 @@ This Windows prototype combines speech transcription with a captured screen that
 can be annotated while recording. It is intended for local evaluation before a
 community discussion and production pull request.
 
+The Windows trial is named **Handy Preview**. Its app icon and all light/dark tray
+states include a blue **P** badge; recording, processing, and warning artwork stay
+distinct. The application identifier and portable `Data` directory are unchanged,
+so existing settings and models are reused. It still shares Handy's single-instance
+lock: exit the installed Handy before opening the portable preview.
+
 ## Interaction model
 
 Ordinary dictation remains unchanged:
@@ -31,16 +37,38 @@ While annotating:
   anchors the new number. **Next point** remains available as a button.
 - Choose an ink color and stroke width.
 - Clear all ink without discarding the screen capture, point numbers, or speech.
+- Scroll over the captured page to move the original application's scroll area
+  under the pointer. The frozen image, ink, and controls disappear while
+  scrolling so the live source is visible. The next drawing press captures
+  the current view and resumes drawing, including that first drag.
+  The source is the window under the pointer when annotation starts, even if a
+  different application has keyboard focus. The original paste destination is
+  unchanged.
+  Keep holding Left Alt+Space; Ctrl still starts the next point and does not
+  become Ctrl+wheel zoom in the source application.
+- Previous ink stays with its original screen capture, not over the new
+  content. The live surface intercepts drawing presses: they never click a
+  source link, button, or selection. A point can span several
+  captures; its number is repeated on those screens and retains one speech
+  segment. Clearing ink affects only the current screen.
 - Read the live transcript below the controls when the selected model supports
   streaming. Numbered comments are transcribed locally per point after finishing.
 - Release Alt or Space, or press the green check, to finish. Press **Escape**
   while still holding the chord to cancel without pasting.
 
-Finishing hides the annotation window immediately, restores the previously active
-application, then pastes one numbered PNG followed by the matching numbered
+Finishing hides the annotation window immediately. If browsing, it captures the
+last live view before restoring the previously active application, then pastes
+one numbered PNG followed by the matching numbered
 comments. Silent points keep their number and an empty comment. A point finished
 without a drawing keeps its badge in the top-left margin; numbers are never
 silently removed or reassigned.
+
+When scrolling changes the captured screen, the result is still **one PNG**:
+full-size annotated screens are stacked vertically, in capture order, with
+`Screen 1`, `Screen 2`, etc. headers. This is not a seamless full-page screenshot:
+overlapping content and fixed page headers are retained, and scrolling back
+does not relocate earlier ink onto the live page. No browser extension, document
+coordinate inference, or external service is involved.
 
 ## Implementation
 
@@ -82,6 +110,44 @@ and image processing remain local.
 The annotation webview is created once and reused. Its lifecycle distinguishes
 recording, finalizing, and finalized states so a delayed image-load callback
 cannot re-show the overlay after recording stops.
+After Windows activates the overlay, the embedded WebView is explicitly focused:
+activating only the outer window can leave wheel input outside the canvas.
+
+Scrolling selects the source window under the initial pointer independently of
+the foreground paste destination. Source hit-testing, monitor capture, and wheel
+routing use physical pixels, including on DPI-unaware worker threads.
+It forwards only Win32 wheel messages to that source window's child under the
+pointer, without Alt/Ctrl/Space modifier flags or synthesized key events.
+Wheel input is serialized. Entering browse preserves the current canvas, installs
+a session-scoped `WH_MOUSE_LL` hook on the UI thread, then hides the overlay.
+The source is genuinely visible and owns native hit-testing. Keeping an input
+shield above Chromium instead caused forwarded wheels to return to the overlay.
+The hook consumes wheels in the captured region and forwards them through the
+same modifier-free route. It consumes the first drawing press, moves and matching
+release before the source receives them. No snapshot is taken per wheel. The
+press waits for an in-flight wheel, captures once, and buffers its drag until
+image decoding completes. Controls and point markers reappear after refreezing;
+the hook stays installed until the protected gesture ends.
+The prior annotated view is archived only when the capture changes; unchanged
+captures restore its original ink without creating a duplicate screen. Ctrl
+boundaries, including undrawn points, are preserved across the transition.
+The overlay stays hidden during recapture; Windows' temporary
+`WDA_EXCLUDEFROMCAPTURE` affinity also excludes a visible overlay during late
+finalization. Held modifier keys are never synthesized or released.
+The session/capture IDs reject stale work; release waits for in-flight scroll,
+capture, and the buffered first stroke
+without sending queued future scrolls, and cancellation prevents delayed
+capture callbacks from changing a later session. Capture errors preserve the
+previous annotations and show a retry message rather than clearing them.
+Hook removal is serialized on the UI thread. Finish/cancel drain a swallowed
+button down through its matching up before removing the hook, without leaking an
+unmatched release to the source. Focus changes do not disable first-press
+protection in the captured region; capture/show still reject unrelated apps.
+Full-size screen PNGs are joined natively instead of exceeding browser canvas
+height limits. All temporary source captures are removed when the session ends.
+Local diagnostic logs correlate wheel receipt, recapture, and canvas draw by
+session/capture ID. The draw acknowledgement contains no screen or speech content;
+it confirms a canvas update, not that the source application actually scrolled.
 
 ## Development
 
@@ -117,14 +183,79 @@ cargo test --manifest-path src-tauri\Cargo.toml --lib annotation
 bun run test:playwright annotation.spec.ts
 ```
 
+On Windows with Edge already installed, the browser checks can use it without
+downloading Playwright's Chromium:
+
+```powershell
+$env:PLAYWRIGHT_CHROMIUM_CHANNEL = "msedge"
+bun run test:playwright annotation --workers=2 --reporter=line
+```
+
 The browser checks use a synthetic screenshot and mocked Tauri commands; they do
-not capture the display, record audio, or paste into another application.
+not capture the display, record audio, or paste into another application. Scroll
+checks use an isolated synthetic scrollable document. Native tests send wheel
+messages only to an owned hidden test window and verify GDI capture exclusion
+using a 2-by-2-pixel patch entirely covered by two owned, opaque color-fixture
+windows. They also verify pointer-based selection of inactive source windows and
+physical-coordinate routing from a DPI-unaware worker. They do not operate or
+capture a user app or persist captured pixels.
+
+The opt-in Windows integration check uses the real built annotation frontend and
+native overlay above two scrollable child WebViews:
+
+```powershell
+bun run build
+cargo test --manifest-path src-tauri\Cargo.toml --features annotation-scroll-check --lib live_browse_intercepts_first_press_and_refreezes -- --nocapture
+```
+
+It checks wheel receipt with thread-local held Alt/Space state, the pointed
+child's actual source offset after scrolling settles, displacement of a known
+landmark in live desktop pixels, and native hit-testing of the source while the
+overlay is hidden. It drives another wheel and the first gesture through the
+installed production hook callback, requiring its blocking return value. It
+checks first-stroke replay, native recapture, matching canvas landmark, no source
+pointer press, protection through overlay redisplay, and cancel-time button
+draining. The
+other child and point/audio boundaries must remain unchanged. Captures are
+restricted to an opaque, owned
+synthetic source; temporary captures and an isolated WebView profile are removed
+afterward. No microphone, clipboard, global key injection, or user-app capture is
+used. This does not inject a physical mouse gesture or test physical hook
+delivery, the global shortcut, or a particular external host such as Copilot's
+Browser canvas.
+Browser-only success does not establish native click interception or live
+desktop visibility; those require the native fixture to complete successfully.
+
+Use an interactive Windows desktop. The check refuses to start while another
+annotation window is visible and fails with a bounded timeout rather than
+bypassing Windows' foreground protection or requesting manual focus changes.
+The `--lib` entry avoids rebuilding a running `handy.exe`. If Tauri's build
+script cannot copy locked runtime resources while Preview runs, checks can
+temporarily set `$env:TAURI_CONFIG = '{"bundle":{"resources":[]}}'`; remove this
+override before a normal application build.
 
 ## Prototype constraints
 
 - Windows only.
+- One production startup attempt failed with WebView2 `0x80070057` before the
+  main UI and shortcuts initialized. An instrumented restart succeeded without a
+  product startup change. The failing API and cause remain unconfirmed; the
+  diagnostic build's successful startup does not establish normal-build reliability.
 - Captures one monitor: the monitor containing the pointer when recording starts.
 - The destination application must support pasting images.
+- Source scrolling depends on the target accepting standard Windows wheel
+  messages. Elevated/protected apps and custom input surfaces may reject them.
+  Keep the pointer over the original app; the preview will not scroll a
+  different app or reclaim focus after you switch away.
+- Source-page scrolling requires Windows 10 version 2004 or later and desktop
+  composition; older systems retain frozen-screen annotation but reject scrolling.
+- Drawing uses frozen captures; browsing hides the overlay to expose the live
+  source. Clicking while browsing starts drawing, not interaction with
+  source controls. Animated or slowly loading content may change after the
+  first-press capture. Keep the original application active; if you switch away,
+  release the held shortcut or press Escape before interacting with another app
+  in the captured region. Long sessions
+  create tall PNGs, which the destination app must be able to paste.
 - Image and text are pasted as two clipboard operations because many applications
   do not consume mixed clipboard formats consistently.
 - One local transcription is run per point at completion. This adds processing
